@@ -66,6 +66,14 @@ function applySettings(settings) {
 	// Initialize i18n with current language setting
 	// 根据当前语言设置初始化国际化
 	initI18n(settings);
+	
+	// 如果设置中没有语言，保存自动检测到的语言
+	if (!settings.language) {
+		import('./util.i18n.js').then(({ getCurrentLanguage }) => {
+			settings.language = getCurrentLanguage();
+			saveSettings(settings);
+		});
+	}
 }
 
 // Ask for browser notification permission
