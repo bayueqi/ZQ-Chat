@@ -7,7 +7,7 @@
 ### 方法一：一键部署到 Cloudflare Workers
 
 点击下方按钮即可一键部署到 Cloudflare Workers：
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button?projectName=NodeCrypt)](https://deploy.workers.cloudflare.com/?url=https://github.com/BAYUEQI/ZQ-Chat)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button?projectName=zq-chat)](https://deploy.workers.cloudflare.com/?url=https://github.com/BAYUEQI/ZQ-Chat)
 > 注意：此方式会基于主仓库创建新项目，后续主仓库更新不会自动同步。
 
 ### 方法二：自动同步 fork 并部署（推荐长期维护）
