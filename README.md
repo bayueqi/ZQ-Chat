@@ -10,7 +10,7 @@
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button?projectName=zq-chat)](https://deploy.workers.cloudflare.com/?url=https://github.com/BAYUEQI/ZQ-Chat)
 > 注意：此方式会基于主仓库创建新项目，后续主仓库更新不会自动同步。
 
-### 方法二：自动同步 fork 并部署（推荐长期维护）
+### 方法二：自动同步 fork 并部署
 1. 先 fork 本项目到你自己的 GitHub 账号。
 2. 打开 Cloudflare Workers 控制台，选择“从 GitHub 导入”，并选择你 fork 的仓库进行部署。
 > 本项目已内置自动同步 workflow，fork 后无需任何操作，主仓库的更新会自动同步到你的 fork 仓库，Cloudflare 也会自动重新部署，无需手动维护。
