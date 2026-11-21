@@ -439,7 +439,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 		const deadline = Date.now() + SEND_ABORT_MS;
 		let delay = 50;
 		while (Date.now() < deadline) {
-			if (isChatWritable(chat) && onSend(payload) !== false) return true;
+			if (isChatWritable(chat) && (await onSend(payload)) !== false) return true;
 			await sleep(delay);
 			delay = Math.min(delay * 2, 500);
 		}
@@ -592,18 +592,18 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 	const chat = fileTransfer.chat || getActiveChat();
 	const canWrite = () => isChatWritable(chat);
 
-	// 单卷发送，返回是否真正写入连接
-	const writeVolume = (index) => onSend({
+	// 单卷发送，等加密线程返回后判断是否真正写入连接
+	const writeVolume = async (index) => (await onSend({
 		type: 'file_volume',
 		fileId,
 		volumeIndex: index,
 		volumeData: volumeAt(index),
 		isLast: index === total - 1
-	}) !== false;
+	})) !== false;
 
-	const finish = () => {
+	const finish = async () => {
 		fileTransfer.sendDone = true;
-		onSend({ type: 'file_complete', fileId });
+		await onSend({ type: 'file_complete', fileId });
 		// 数据已全部发出，等接收端回 file_ack 再收尾
 		fileTransfer.status = 'sent';
 		updateFileProgress(fileId);
@@ -622,12 +622,12 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 		for (const index of indices) {
 			if (!Number.isInteger(index) || index < 0 || index >= total) continue;
 			while (!canWrite()) await sleep(10);
-			while (!writeVolume(index)) await sleep(10);
+			while (!(await writeVolume(index))) await sleep(10);
 			await sleep(0);
 		}
 		// 补发期间主循环还未结束的话，完成消息由主循环负责发出
 		if (fileTransfer.sendDone) {
-			onSend({ type: 'file_complete', fileId });
+			await onSend({ type: 'file_complete', fileId });
 		}
 	};
 
@@ -663,7 +663,7 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 			}
 			// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
 			// 不跳过、不计入已发送，等连接恢复后从这一卷继续
-			const sent = canWrite() ? writeVolume(currentVolume) : false;
+			const sent = canWrite() ? await writeVolume(currentVolume) : false;
 			if (!sent) break;
 			currentVolume++;
 			moved++;
@@ -700,7 +700,7 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 		refreshUi(currentVolume === total);
 	}
 
-	finish();
+	await finish();
 }
 
 // Update file progress in chat

@@ -16,6 +16,117 @@ import {
 } from 'buffer';
 window.Buffer = Buffer;
 
+// 超过这个长度的帧一定是文件分卷，走线程池解密
+const LARGE_FRAME_BYTES = 128 * 1024;
+// 单个加密任务的最长等待，超时退回主线程，避免线程卡死时消息全堵
+const CIPHER_TASK_TIMEOUT_MS = 20000;
+
+// 加解密线程池。整卷的加密解密放在 worker 里跑，主线程只负责切片与写连接
+class CipherPool {
+	constructor(size, onError) {
+		this.workers = [];
+		this.pending = new Map();
+		this.seq = 0;
+		this.cursor = 0;
+		this.failed = false;
+		this.onError = onError || null;
+		try {
+			for (let i = 0; i < size; i++) {
+				const worker = new Worker(new URL('./crypt.worker.js', import.meta.url), {
+					type: 'module'
+				});
+				worker.onmessage = (event) => this.settle(event.data);
+				worker.onerror = (event) => {
+					this.failed = true;
+					if (this.onError) this.onError(event)
+				};
+				this.workers.push(worker)
+			}
+		} catch (error) {
+			this.failed = true;
+			if (this.onError) this.onError(error)
+		}
+	}
+
+	get ready() {
+		return !this.failed && this.workers.length > 0
+	}
+
+	settle(message) {
+		const task = this.pending.get(message.id);
+		if (!task) {
+			return
+		}
+		this.pending.delete(message.id);
+		if (message.error) {
+			task.reject(new Error(message.error))
+		} else {
+			task.resolve(message.result)
+		}
+	}
+
+	run(op, args) {
+		if (!this.ready) {
+			return Promise.reject(new Error('cipher pool unavailable'))
+		}
+		const id = ++this.seq;
+		const worker = this.workers[this.cursor++ % this.workers.length];
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				if (this.pending.delete(id)) {
+					reject(new Error('cipher task timeout'))
+				}
+			}, CIPHER_TASK_TIMEOUT_MS);
+			this.pending.set(id, {
+				resolve: (value) => {
+					clearTimeout(timer);
+					resolve(value)
+				},
+				reject: (error) => {
+					clearTimeout(timer);
+					reject(error)
+				}
+			});
+			worker.postMessage(Object.assign({
+				id,
+				op
+			}, args))
+		})
+	}
+
+	destroy() {
+		for (const worker of this.workers) {
+			try {
+				worker.terminate()
+			} catch (error) {}
+		}
+		this.workers = [];
+		this.pending.clear()
+	}
+}
+
+// 多个房间共用一个池，线程数按本机核数定，避免开房间越多线程越膨胀
+let sharedCipherPool = null;
+
+function getCipherPool() {
+	if (sharedCipherPool) {
+		return sharedCipherPool
+	}
+	if (typeof Worker === 'undefined' || typeof URL === 'undefined') {
+		return null
+	}
+	const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+	const size = Math.max(2, Math.min(4, cores - 1));
+	try {
+		sharedCipherPool = new CipherPool(size, (error) => {
+			if (typeof console !== 'undefined') console.warn('cipher pool', error)
+		})
+	} catch (error) {
+		sharedCipherPool = null
+	}
+	return sharedCipherPool
+}
+
 // Main NodeCrypt class for secure communication
 // 用于安全通信的 NodeCrypt 主类
 class NodeCrypt {
@@ -69,7 +180,12 @@ class NodeCrypt {
 		this.encryptServerMessage = this.encryptServerMessage.bind(this);
 		this.decryptServerMessage = this.decryptServerMessage.bind(this);
 		this.encryptClientMessage = this.encryptClientMessage.bind(this);
-		this.decryptClientMessage = this.decryptClientMessage.bind(this)
+		this.decryptClientMessage = this.decryptClientMessage.bind(this);
+		this.sendChannelMessageAsync = this.sendChannelMessageAsync.bind(this);
+		this.processServerDecrypted = this.processServerDecrypted.bind(this);
+		this.handleClientDecrypted = this.handleClientDecrypted.bind(this);
+		this.handleLargeFrame = this.handleLargeFrame.bind(this);
+		this.cipherPool = getCipherPool()
 	}
 
 	// Set user credentials (username, channel, password)
@@ -237,7 +353,46 @@ class NodeCrypt {
 			}
 			return
 		}
-		const serverDecrypted = this.decryptServerMessage(event.data, this.serverShared);
+		// 文件分卷整帧交给线程池，主线程不被几百 KB 的加解密卡住；
+		// 期间到达的普通消息照常同步处理，不会被分卷堵在后面
+		if (this.cipherPool && this.cipherPool.ready && event.data.length >= LARGE_FRAME_BYTES) {
+			this.handleLargeFrame(event.data);
+			return
+		}
+		this.processServerDecrypted(this.decryptServerMessage(event.data, this.serverShared))
+	}
+
+	// 分卷整帧解密：外层通道与内层客户端层都在线程池完成
+	async handleLargeFrame(frame) {
+		try {
+			const channel = {};
+			for (const clientId in this.channel) {
+				if (this.channel[clientId].shared) {
+					channel[clientId] = this.channel[clientId].shared
+				}
+			}
+			const result = await this.cipherPool.run('unpack', {
+				frame,
+				serverKey: this.serverShared,
+				channel
+			});
+			if (!result) {
+				return
+			}
+			if (result.kind === 'client') {
+				this.handleClientDecrypted(result.cid, result.data)
+			} else {
+				this.processServerDecrypted(result.data)
+			}
+		} catch (error) {
+			this.logEvent('handleLargeFrame', error, 'error');
+			// 线程池异常时退回主线程，宁可慢也不丢消息
+			this.processServerDecrypted(this.decryptServerMessage(frame, this.serverShared))
+		}
+	}
+
+	// 已解开外层通道的消息
+	processServerDecrypted(serverDecrypted) {
 		this.logEvent('onMessage-server-decrypted', serverDecrypted);
 		if (!this.isObject(serverDecrypted) || !this.isString(serverDecrypted.a)) {
 			return
@@ -319,41 +474,49 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
-			const clientDecrypted = this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
-			this.logEvent('onMessage-client-decrypted', clientDecrypted);
-			if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
-				return
-			}
-			if (clientDecrypted.a === 'u' && this.isString(clientDecrypted.p) && clientDecrypted.p.match(/\S+/) && !this.channel[serverDecrypted.c].username) {
-				this.channel[serverDecrypted.c].username = clientDecrypted.p.replace(/^\s+/, '').replace(/\s+$/, '');
-				if (this.callbacks.onClientSecured) {
-					try {
-						this.callbacks.onClientSecured({
-							clientId: serverDecrypted.c,
-							username: this.channel[serverDecrypted.c].username
-						})
-					} catch (error) {
-						this.logEvent('onMessage-client-secured-callback', error, 'error')
-					}
+			this.handleClientDecrypted(serverDecrypted.c, this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared))
+		}
+	}
+
+	// 内层消息已解开：用户名上报，或一条普通消息
+	handleClientDecrypted(cid, clientDecrypted) {
+		this.logEvent('onMessage-client-decrypted', clientDecrypted);
+		if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
+			return
+		}
+		const peer = this.channel[cid];
+		if (!peer) {
+			return
+		}
+		if (clientDecrypted.a === 'u' && this.isString(clientDecrypted.p) && clientDecrypted.p.match(/\S+/) && !peer.username) {
+			peer.username = clientDecrypted.p.replace(/^\s+/, '').replace(/\s+$/, '');
+			if (this.callbacks.onClientSecured) {
+				try {
+					this.callbacks.onClientSecured({
+						clientId: cid,
+						username: peer.username
+					})
+				} catch (error) {
+					this.logEvent('onMessage-client-secured-callback', error, 'error')
 				}
-				return
-			}			if (!this.channel[serverDecrypted.c].username) {
-				return
 			}
-			if (clientDecrypted.a === 'm' && this.isString(clientDecrypted.t) && (this.isString(clientDecrypted.d) || this.isObject(clientDecrypted.d))) {
-				if (this.callbacks.onClientMessage) {
-					try {
-						this.callbacks.onClientMessage({
-							clientId: serverDecrypted.c,
-							username: this.channel[serverDecrypted.c].username,
-							type: clientDecrypted.t,
-							data: clientDecrypted.d
-						})
-					} catch (error) {
-						this.logEvent('onMessage-client-message-callback', error, 'error')
-					}
+			return
+		}
+		if (!peer.username) {
+			return
+		}
+		if (clientDecrypted.a === 'm' && this.isString(clientDecrypted.t) && (this.isString(clientDecrypted.d) || this.isObject(clientDecrypted.d))) {
+			if (this.callbacks.onClientMessage) {
+				try {
+					this.callbacks.onClientMessage({
+						clientId: cid,
+						username: peer.username,
+						type: clientDecrypted.t,
+						data: clientDecrypted.d
+					})
+				} catch (error) {
+					this.logEvent('onMessage-client-message-callback', error, 'error')
 				}
-				return
 			}
 		}
 	}
@@ -561,6 +724,104 @@ class NodeCrypt {
 			}
 		}
 		return (false)
+	}
+
+	// 频道广播的异步版本：整卷加解密在线程池完成，主线程只负责写入连接
+	sendChannelMessageAsync(type, data) {
+		if (!this.serverShared) {
+			return Promise.resolve(false)
+		}
+		const targets = [];
+		for (const clientId in this.channel) {
+			if (this.channel[clientId].shared && this.channel[clientId].username) {
+				targets.push({
+					cid: clientId,
+					key: this.channel[clientId].shared
+				})
+			}
+		}
+		// 频道里没有完成密钥交换的接收者时消息发不出去，必须返回失败
+		if (targets.length === 0) {
+			return Promise.resolve(false)
+		}
+		const serverKey = this.serverShared;
+		const write = (payload) => {
+			if (!payload || typeof payload !== 'string' || payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
+				return false
+			}
+			if (!this.isOpen()) {
+				return false
+			}
+			this.connection.send(payload);
+			return true
+		};
+		if (!this.cipherPool || !this.cipherPool.ready) {
+			return Promise.resolve(this.sendChannelMessage(type, data))
+		}
+		return this.cipherPool.run('pack', {
+			type,
+			data,
+			targets,
+			serverKey
+		}).then(write, (error) => {
+			this.logEvent('sendChannelMessageAsync', error, 'error');
+			return this.sendChannelMessage(type, data)
+		})
+	}
+
+	// 私聊：内层给指定客户端，外层走服务端通道
+	sendPrivateMessage(type, data, targetId) {
+		const peer = this.channel[targetId];
+		if (!this.serverShared || !peer || !peer.shared) {
+			return (false)
+		}
+		try {
+			const inner = this.encryptClientMessage({
+				a: 'm',
+				t: type,
+				d: data
+			}, peer.shared);
+			const payload = this.encryptServerMessage({
+				a: 'c',
+				p: inner,
+				c: targetId
+			}, this.serverShared);
+			if (!payload || payload.length === 0 || payload.length > (8 * 1024 * 1024) || !this.isOpen()) {
+				return (false)
+			}
+			this.connection.send(payload);
+			return (true)
+		} catch (error) {
+			this.logEvent('sendPrivateMessage', error, 'error')
+		}
+		return (false)
+	}
+
+	// 私聊的异步版本，大文件走这条
+	sendPrivateMessageAsync(type, data, targetId) {
+		const peer = this.channel[targetId];
+		if (!this.serverShared || !peer || !peer.shared) {
+			return Promise.resolve(false)
+		}
+		if (!this.cipherPool || !this.cipherPool.ready) {
+			return Promise.resolve(this.sendPrivateMessage(type, data, targetId))
+		}
+		return this.cipherPool.run('pack-private', {
+			type,
+			data,
+			cid: targetId,
+			key: peer.shared,
+			serverKey: this.serverShared
+		}).then((payload) => {
+			if (!payload || payload.length === 0 || payload.length > (8 * 1024 * 1024) || !this.isOpen()) {
+				return false
+			}
+			this.connection.send(payload);
+			return true
+		}, (error) => {
+			this.logEvent('sendPrivateMessageAsync', error, 'error');
+			return this.sendPrivateMessage(type, data, targetId)
+		})
 	}
 
 	// Encrypt a message for the server

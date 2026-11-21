@@ -296,52 +296,39 @@ window.addEventListener('DOMContentLoaded', () => {
 		fileInputSelector: '.new-message-wrapper input[type="file"]', // 文件输入框选择器 / File input selector
 		onSend: (message, targetRoom) => {
 			const rd = targetRoom || roomsData[activeRoomIndex];
-			if (rd && rd.chat) {
-				const userName = rd.myUserName || '';
-				const msgWithUser = { ...message, userName };
-				if (rd.privateChatTargetId) {
-					// 私聊文件加密并发送
-					// Encrypt and send private file message
-					const targetClient = rd.chat.channel[rd.privateChatTargetId];
-					if (targetClient && targetClient.shared) {
-						const clientMessagePayload = {
-							a: 'm',
-							t: msgWithUser.type + '_private',
-							d: msgWithUser
-						};
-						const encryptedClientMessage = rd.chat.encryptClientMessage(clientMessagePayload, targetClient.shared);
-						const serverRelayPayload = {
-							a: 'c',
-							p: encryptedClientMessage,
-							c: rd.privateChatTargetId
-						};
-						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
-						const sent = rd.chat.sendMessage(encryptedMessageForServer);
-						
-						// 添加到自己的聊天记录
-						if (msgWithUser.type === 'file_start' && !loggedFileStarts.has(msgWithUser.fileId)) {
-							loggedFileStarts.add(msgWithUser.fileId);
-							addMsg(msgWithUser, false, 'file_private');
-						}
-						return sent;
-					} else {
-						notifyPrivateFail(rd.privateChatTargetId, `${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
-						return false;
-					}
-				} else {
-					// 公共频道文件发送
-					// Send file to public channel
-					const sent = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
-					
-					// 添加到自己的聊天记录
-					if (msgWithUser.type === 'file_start' && !loggedFileStarts.has(msgWithUser.fileId)) {
-						loggedFileStarts.add(msgWithUser.fileId);
-						addMsg(msgWithUser, false, 'file');
-					}
-					return sent;
-				}
+			if (!rd || !rd.chat) {
+				return false;
 			}
-			return false;
+			const userName = rd.myUserName || '';
+			const msgWithUser = { ...message, userName };
+			// 分卷只在这里记一次本地记录，重连重发不会重复插入
+			const logFileStart = (kind) => {
+				if (msgWithUser.type === 'file_start' && !loggedFileStarts.has(msgWithUser.fileId)) {
+					loggedFileStarts.add(msgWithUser.fileId);
+					addMsg(msgWithUser, false, kind);
+				}
+			};
+			if (rd.privateChatTargetId) {
+				// 私聊文件加密并发送
+				// Encrypt and send private file message
+				const targetClient = rd.chat.channel[rd.privateChatTargetId];
+				if (!targetClient || !targetClient.shared) {
+					notifyPrivateFail(rd.privateChatTargetId, `${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+					return false;
+				}
+				return rd.chat.sendPrivateMessageAsync(msgWithUser.type + '_private', msgWithUser, rd.privateChatTargetId)
+					.then((sent) => {
+						if (sent) logFileStart('file_private');
+						return sent;
+					});
+			}
+			// 公共频道文件发送，加密在线程池完成，返回 Promise
+			// Send file to public channel
+			return rd.chat.sendChannelMessageAsync(msgWithUser.type, msgWithUser)
+				.then((sent) => {
+					if (sent) logFileStart('file');
+					return sent;
+				});
 		}
 	});
 
