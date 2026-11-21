@@ -699,18 +699,13 @@ function updateFileProgress(fileId) {
 		const isSender = !transfer.volumeData || transfer.volumeData.length === 0;
 		
 		if (transfer.status === 'sending') {
-			// 发送端按对方已收到的卷数显示，两边数字保持一致；
-			// 还没有进度回报时退回到本地已写入的卷数
-			const shown = Number.isInteger(transfer.peerReceived)
-				? Math.min(transfer.peerReceived, transfer.sentVolumes)
-				: transfer.sentVolumes;
-			const progress = (shown / transfer.totalVolumes) * 100;
+			const progress = (transfer.sentVolumes / transfer.totalVolumes) * 100;
 			if (progressContainer) {
 				progressContainer.style.display = 'block';
 				progressContainer.classList.remove('fade-out');
 			}
 			if (progressBar) progressBar.style.width = `${progress}%`;
-			if (statusText) statusText.textContent = `Sending ${shown}/${transfer.totalVolumes}`;
+			if (statusText) statusText.textContent = `Sending ${transfer.sentVolumes}/${transfer.totalVolumes}`;
 			if (downloadBtn) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
