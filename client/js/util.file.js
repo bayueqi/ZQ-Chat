@@ -599,12 +599,23 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	let currentVolume = 0;
 	let stalledSince = 0;
 
-	while (currentVolume < total) {
-		// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
-		// 不跳过、不计入已发送，等连接恢复后从这一卷继续
-		const sent = canWrite() ? writeVolume(currentVolume) : false;
+	// 每批 5 卷、间隔 100ms。一口气把连接灌满会让服务端转发队列来不及处理，
+	// 连接被中途断开后重连、重新握手，整体反而更慢
+	const BATCH_SIZE = 5;
+	const BATCH_DELAY_MS = 100;
 
-		if (!sent) {
+	while (currentVolume < total) {
+		let moved = 0;
+		while (moved < BATCH_SIZE && currentVolume < total) {
+			// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
+			// 不跳过、不计入已发送，等连接恢复后从这一卷继续
+			const sent = canWrite() ? writeVolume(currentVolume) : false;
+			if (!sent) break;
+			currentVolume++;
+			moved++;
+		}
+
+		if (moved === 0) {
 			if (!stalledSince) stalledSince = Date.now();
 			// 长时间无法写入说明对端不存在或连接始终没有恢复，中止并提示
 			if (Date.now() - stalledSince > SEND_ABORT_MS) {
@@ -620,13 +631,9 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 		}
 
 		stalledSince = 0;
-		currentVolume++;
 		fileTransfer.sentVolumes = currentVolume;
-		if (currentVolume === total || (currentVolume % 8) === 0) {
-			updateFileProgress(fileId);
-		}
-		// 让出主线程，避免压缩与加密把页面卡死
-		await sleep(0);
+		updateFileProgress(fileId);
+		await sleep(BATCH_DELAY_MS);
 	}
 
 	finish();

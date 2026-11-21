@@ -180,6 +180,8 @@ class NodeCrypt {
 		if (!event || !this.isString(event.data)) {
 			return
 		}
+		// 任何服务端消息都算连接还活着，不只看 pong
+		this.lastActivityAt = Date.now();
 		if (event.data === 'pong') {
 			this.lastPongAt = Date.now();
 			return
@@ -220,6 +222,8 @@ class NodeCrypt {
 						a: 'j',
 						p: this.credentials.channel
 					}, this.serverShared));
+					// 握手成功，重连退避从头计算
+					this.reconnectAttempts = 0;
 					if (this.callbacks.onServerSecured) {
 						try {
 							this.callbacks.onServerSecured()
@@ -415,10 +419,13 @@ class NodeCrypt {
 	startReconnect() {
 		this.stopReconnect();
 		this.logEvent('startReconnect');
+		// 连续失败时逐次拉长间隔，避免每隔几秒握手一次把连接反复打断
+		this.reconnectAttempts = (this.reconnectAttempts || 0) + 1;
+		const delay = Math.min(this.config.reconnectDelay * this.reconnectAttempts, 30000);
 		this.reconnect = setTimeout(() => {
 			this.reconnect = null;
 			this.connect()
-		}, this.config.reconnectDelay)
+		}, delay)
 	}
 
 	// Stop reconnect timer
@@ -437,6 +444,7 @@ class NodeCrypt {
 		this.stopPing();
 		this.logEvent('startPing');
 		this.lastPongAt = Date.now();
+		this.lastActivityAt = Date.now();
 
 		if (typeof document !== 'undefined' && !this.visibilityBound) {
 			this.visibilityBound = true;
@@ -444,6 +452,7 @@ class NodeCrypt {
 				if (!document.hidden) {
 					// 后台期间定时器被节流，回到前台补齐一次心跳，避免误判掉线
 					this.lastPongAt = Date.now();
+					this.lastActivityAt = Date.now();
 					this.sendMessage('ping');
 				}
 			});
@@ -454,8 +463,10 @@ class NodeCrypt {
 			if (typeof document !== 'undefined' && document.hidden) {
 				return
 			}
-			// 连续三个周期没有任何回应，说明连接已在中间环节断开，主动重连
-			if (Date.now() - this.lastPongAt > this.config.pingInterval * 3) {
+			// 连续多个周期连任何服务端消息都收不到，才认为连接已在中间环节断开。
+			// 阈值放宽，避免服务端转发繁忙时误判，把正常连接反复踢掉重连
+			const lastSeen = Math.max(this.lastPongAt || 0, this.lastActivityAt || 0);
+			if (Date.now() - lastSeen > this.config.pingInterval * 6) {
 				this.logEvent('ping-timeout');
 				this.disconnect();
 				if (this.credentials && this.callbacks.onServerClosed) {

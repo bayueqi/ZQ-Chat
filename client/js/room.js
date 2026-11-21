@@ -150,7 +150,11 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 				rd.reconnecting = false;
 				rd.suppressPresenceUntil = Date.now() + 8000;
 			}
-			addSystemMsg(t('system.secured', 'connection secured'))
+			// 重连同样会走一遍握手，重复提示会把聊天区刷满，只在首次建立连接时提示
+			if (!rd || !rd.securedAnnounced) {
+				if (rd) rd.securedAnnounced = true;
+				addSystemMsg(t('system.secured', 'connection secured'))
+			}
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
