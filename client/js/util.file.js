@@ -19,6 +19,14 @@ const NACK_GIVEUP_MS = 300000;
 const ACK_TIMEOUT_MS = 90000;
 // 连续无法写入连接多久后中止本次传输
 const SEND_ABORT_MS = 120000;
+// 接收端每收到多少卷回传一次进度
+const PROGRESS_ACK_EVERY = 8;
+// 发送端最多领先接收端多少卷。接收端处理不过来时，它只能排队解密，
+// 期间发出的任何消息（文字、成员进出、确认）都排在几百兆数据后面，
+// 看起来就是对方根本没收到
+const SEND_WINDOW_VOLUMES = 16;
+// 超过这个时间没有收到进度回报就不再限制领先量，避免对方不回消息时卡死
+const PEER_PROGRESS_STALE_MS = 10000;
 
 // File transfer state management
 // 文件传输状态管理
@@ -606,7 +614,17 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 
 	while (currentVolume < total) {
 		let moved = 0;
+		let waitPeer = false;
 		while (moved < BATCH_SIZE && currentVolume < total) {
+			// 接收端还没处理到的分卷太多就先停手。一直猛发会把对方的
+			// 消息队列堆到几百兆，期间所有消息都收不到
+			if (fileTransfer.peerProgressAt && Date.now() - fileTransfer.peerProgressAt < PEER_PROGRESS_STALE_MS) {
+				const ahead = currentVolume - (fileTransfer.peerReceived || 0);
+				if (ahead >= SEND_WINDOW_VOLUMES) {
+					waitPeer = true;
+					break;
+				}
+			}
 			// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
 			// 不跳过、不计入已发送，等连接恢复后从这一卷继续
 			const sent = canWrite() ? writeVolume(currentVolume) : false;
@@ -616,6 +634,12 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 		}
 
 		if (moved === 0) {
+			// 等接收端追上，不算发送失败
+			if (waitPeer) {
+				stalledSince = 0;
+				await sleep(30);
+				continue;
+			}
 			if (!stalledSince) stalledSince = Date.now();
 			// 长时间无法写入说明对端不存在或连接始终没有恢复，中止并提示
 			if (Date.now() - stalledSince > SEND_ABORT_MS) {
@@ -655,13 +679,18 @@ function updateFileProgress(fileId) {
 		const isSender = !transfer.volumeData || transfer.volumeData.length === 0;
 		
 		if (transfer.status === 'sending') {
-			const progress = (transfer.sentVolumes / transfer.totalVolumes) * 100;
+			// 发送端按对方已收到的卷数显示，两边数字保持一致；
+			// 还没有进度回报时退回到本地已写入的卷数
+			const shown = Number.isInteger(transfer.peerReceived)
+				? Math.min(transfer.peerReceived, transfer.sentVolumes)
+				: transfer.sentVolumes;
+			const progress = (shown / transfer.totalVolumes) * 100;
 			if (progressContainer) {
 				progressContainer.style.display = 'block';
 				progressContainer.classList.remove('fade-out');
 			}
 			if (progressBar) progressBar.style.width = `${progress}%`;
-			if (statusText) statusText.textContent = `Sending ${transfer.sentVolumes}/${transfer.totalVolumes}`;
+			if (statusText) statusText.textContent = `Sending ${shown}/${transfer.totalVolumes}`;
 			if (downloadBtn) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
@@ -748,7 +777,21 @@ export function handleFileMessage(message, isPrivate = false, chat = null) {
 		case 'file_ack':
 			handleFileAck(message);
 			break;
+		case 'file_progress':
+			handleFileProgress(message);
+			break;
 	}
+}
+
+// Handle receiver progress report
+// 处理接收端回传的进度
+function handleFileProgress(message) {
+	const { fileId, received } = message;
+	const transfer = window.fileTransfers.get(fileId);
+	if (!transfer || transfer.status !== 'sending' || !Number.isInteger(received)) return;
+	transfer.peerReceived = received;
+	transfer.peerProgressAt = Date.now();
+	updateFileProgress(fileId);
 }
 
 // Handle file start message
@@ -826,6 +869,14 @@ function handleFileVolume(message) {
 	if (transfer.receivedVolumes.size === transfer.totalVolumes) {
 		finishReceive(fileId, transfer);
 		return;
+	}
+	// 回传进度，发送端据此控制领先量，别把对方的消息队列堵住
+	if ((transfer.receivedVolumes.size % PROGRESS_ACK_EVERY) === 0) {
+		sendFileControl({
+			type: 'file_progress',
+			fileId,
+			received: transfer.receivedVolumes.size
+		}, transfer.chat);
 	}
 	// 大文件逐卷刷新会拖慢主线程，按间隔取样
 	if (transfer.totalVolumes <= 10 || (transfer.receivedVolumes.size % 8) === 0) {
