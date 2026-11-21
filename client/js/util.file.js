@@ -19,7 +19,7 @@ const NACK_GIVEUP_MS = 300000;
 // 发送完毕后等待对方确认收齐的超时
 const ACK_TIMEOUT_MS = 90000;
 // 连续无法写入连接多久后中止本次传输
-const SEND_ABORT_MS = 120000;
+const SEND_ABORT_MS = 20000;
 // 超过这个大小的单文件不再压缩，直接分卷发送
 const COMPRESS_SKIP_BYTES = 8 * 1024 * 1024;
 // 接收端每收到多少卷回传一次进度
@@ -437,9 +437,11 @@ async function handleFilesUpload(files, onSend, chat = null) {
 	const sendStart = async (payload) => {
 		const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 		const deadline = Date.now() + SEND_ABORT_MS;
+		let delay = 50;
 		while (Date.now() < deadline) {
 			if (isChatWritable(chat) && onSend(payload) !== false) return true;
-			await sleep(200);
+			await sleep(delay);
+			delay = Math.min(delay * 2, 500);
 		}
 		return false;
 	};
@@ -632,6 +634,8 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 	let currentVolume = 0;
 	let stalledSince = 0;
 	let lastUiAt = 0;
+	// 写不进去时的重试间隔，从短到长，避免空转也避免长时间无响应
+	let retryDelay = 10;
 
 	// 进度条按时间节流，避免每卷都扫一遍 DOM
 	const refreshUi = (force) => {
@@ -685,11 +689,13 @@ async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 				updateFileProgress(fileId);
 				return;
 			}
-			// 缓冲区还没排空，很快就能继续，不必长等
-			await sleep(10);
+			// 缓冲区还没排空或对端暂时不可投递，退避后再试
+			await sleep(retryDelay);
+			retryDelay = Math.min(retryDelay * 2, 400);
 			continue;
 		}
 
+		retryDelay = 10;
 		stalledSince = 0;
 		refreshUi(currentVolume === total);
 	}

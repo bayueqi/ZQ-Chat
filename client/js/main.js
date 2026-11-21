@@ -106,6 +106,15 @@ window.downloadFile = downloadFile;
 // 文件开始消息可能因连接抖动重发，本地聊天记录只插一次
 const loggedFileStarts = new Set();
 
+// 同一个私聊目标短时间内只提示一次：投递重试期间不能反复刷同一条
+const privateFailAt = new Map();
+const notifyPrivateFail = (targetId, text) => {
+	const now = Date.now();
+	if (now - (privateFailAt.get(targetId) || 0) < 8000) return;
+	privateFailAt.set(targetId, now);
+	addSystemMsg(text);
+};
+
 // 当 DOM 内容加载完成后执行初始化逻辑
 // Run initialization logic when the DOM content is fully loaded
 window.addEventListener('DOMContentLoaded', () => {
@@ -221,7 +230,7 @@ window.addEventListener('DOMContentLoaded', () => {
 						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);						rd.chat.sendMessage(encryptedMessageForServer);
 						addMsg(messageContent, false, 'image_private');
 					} else {
-						addSystemMsg(`${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						notifyPrivateFail(rd.privateChatTargetId, `${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
 					}
 				} else {
 					// 公共频道图片消息发送
@@ -253,7 +262,7 @@ window.addEventListener('DOMContentLoaded', () => {
 						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
 						rd.chat.sendMessage(encryptedMessageForServer);					addMsg(text, false, 'text_private');
 					} else {
-						addSystemMsg(`${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						notifyPrivateFail(rd.privateChatTargetId, `${t('system.private_message_failed', 'Cannot send private message to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
 					}
 				} else {
 					// 公共频道消息发送
@@ -316,7 +325,7 @@ window.addEventListener('DOMContentLoaded', () => {
 						}
 						return sent;
 					} else {
-						addSystemMsg(`${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						notifyPrivateFail(rd.privateChatTargetId, `${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
 						return false;
 					}
 				} else {
