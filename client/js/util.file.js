@@ -8,7 +8,7 @@ const DEFAULT_VOLUME_SIZE = 256 * 1024; // 256KB 原始数据，编码并加密�
 
 // 未写入连接的字节数超过此值时暂停发送。不设上限时大文件会把几百兆数据
 // 堆在发送缓冲区里，心跳和数据控制消息排在后面，连接被判定超时后重连。
-const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+const MAX_BUFFERED_BYTES = 6 * 1024 * 1024;
 // 接收端向发送端请求补发的最大轮数
 const MAX_NACK_ATTEMPTS = 3;
 // 分卷中断多久后判定为缺卷并请求补发
@@ -19,6 +19,8 @@ const NACK_GIVEUP_MS = 300000;
 const ACK_TIMEOUT_MS = 90000;
 // 连续无法写入连接多久后中止本次传输
 const SEND_ABORT_MS = 120000;
+// 超过这个大小的单文件不再压缩，直接分卷发送
+const COMPRESS_SKIP_BYTES = 8 * 1024 * 1024;
 // 接收端每收到多少卷回传一次进度
 const PROGRESS_ACK_EVERY = 8;
 // 发送端最多领先接收端多少卷。接收端处理不过来时，它只能排队解密，
@@ -106,7 +108,29 @@ async function compressFileToVolumes(file, volumeSize = DEFAULT_VOLUME_SIZE) { /
 			try {
 				// Calculate hash of original file for integrity
 				const originalHash = await calculateHash(arrayBuffer);
-				
+
+				const split = (payload, didCompress) => {
+					const volumes = [];
+					for (let i = 0; i < payload.length; i += volumeSize) {
+						const volume = payload.slice(i, i + volumeSize);
+						volumes.push(arrayBufferToBase64(volume));
+					}
+					resolve({
+						volumes,
+						originalSize: file.size,
+						compressedSize: payload.length,
+						originalHash,
+						compressed: didCompress
+					});
+				};
+
+				// 大文件不压缩：视频、图片、压缩包本身没有压缩空间，
+				// 整份过一遍 deflate 只会让发送端和接收端各卡住十几秒
+				if (arrayBuffer.length > COMPRESS_SKIP_BYTES) {
+					split(arrayBuffer, false);
+					return;
+				}
+
 				// Use single compression pass with balanced compression
 				// 使用单次压缩，平衡压缩率和速度
 				deflate(arrayBuffer, { 
@@ -117,20 +141,7 @@ async function compressFileToVolumes(file, volumeSize = DEFAULT_VOLUME_SIZE) { /
 						reject(err);
 						return;
 					}
-					
-					// Split compressed data into volumes
-					const volumes = [];
-					for (let i = 0; i < compressed.length; i += volumeSize) {
-						const volume = compressed.slice(i, i + volumeSize);
-						volumes.push(arrayBufferToBase64(volume));
-					}
-					
-					resolve({
-						volumes,
-						originalSize: file.size,
-						compressedSize: compressed.length,
-						originalHash
-					});
+					split(compressed, true);
 				});
 			} catch (hashError) {
 				reject(hashError);
@@ -237,7 +248,7 @@ function readFileAsArrayBuffer(file) {
 
 // Decompress volumes back to file
 // 将分卷解压回文件
-async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
+async function decompressVolumesToFile(volumes, fileName, originalHash = null, compressedMode = true) {
 	try {
 		// Combine all volumes using base64 decoding
 		const combinedData = volumes.map(volume => {
@@ -245,47 +256,54 @@ async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
 		});
 		
 		const totalLength = combinedData.reduce((sum, arr) => sum + arr.length, 0);
-		const compressed = new Uint8Array(totalLength);
+		const data = new Uint8Array(totalLength);
 		let offset = 0;
 		
-		for (const data of combinedData) {
-			compressed.set(data, offset);
-			offset += data.length;
+		for (const item of combinedData) {
+			data.set(item, offset);
+			offset += item.length;
 		}
-				// Decompress
+
+		const save = async (bytes) => {
+			// Verify hash if provided
+			if (originalHash) {
+				const calculatedHash = await calculateHash(bytes);
+				if (calculatedHash !== originalHash) {
+					throw new Error('File integrity check failed: hash mismatch');
+				}
+			}
+
+			// Create blob and download
+			const blob = new Blob([bytes]);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = fileName;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+		};
+
+		// 发送端没有压缩时直接落盘，省掉一次整文件的 inflate
+		if (!compressedMode) {
+			await save(data);
+			return;
+		}
+
+		// Decompress
 		return new Promise((resolve, reject) => {
-			inflate(compressed, async (err, decompressed) => {
+			inflate(data, async (err, decompressed) => {
 				if (err) {
 					reject(err);
 					return;
 				}
-				
-				// Verify hash if provided
-				if (originalHash) {
-					try {
-						const calculatedHash = await calculateHash(decompressed);
-						if (calculatedHash !== originalHash) {
-							reject(new Error('File integrity check failed: hash mismatch'));
-							return;
-						}
-					} catch (hashError) {
-						reject(new Error('File integrity check failed: ' + hashError.message));
-						return;
-					}
+				try {
+					await save(decompressed);
+					resolve();
+				} catch (hashError) {
+					reject(hashError);
 				}
-				
-				// Create blob and download
-				const blob = new Blob([decompressed]);
-				const url = URL.createObjectURL(blob);
-				const a = document.createElement('a');
-				a.href = url;
-				a.download = fileName;
-				document.body.appendChild(a);
-				a.click();
-				document.body.removeChild(a);
-				URL.revokeObjectURL(url);
-				
-				resolve();
 			});
 		});
 	} catch (error) {
@@ -453,7 +471,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 			const file = files[0];
 			showProgress();
 			
-			const { volumes, originalSize, compressedSize, originalHash } = await compressFileToVolumes(file);
+			const { volumes, originalSize, compressedSize, originalHash, compressed } = await compressFileToVolumes(file);
 			
 			updateProgress();
 			
@@ -463,6 +481,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				fileName: file.name,
 				originalSize,
 				compressedSize,
+				compressed,
 				totalVolumes: volumes.length,
 				sentVolumes: 0,
 				status: 'sending',
@@ -479,6 +498,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				fileName: file.name,
 				originalSize,
 				compressedSize,
+				compressed,
 				totalVolumes: volumes.length,
 				originalHash
 			});
@@ -607,9 +627,9 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	let currentVolume = 0;
 	let stalledSince = 0;
 
-	// 每批 5 卷、间隔 100ms。一口气把连接灌满会让服务端转发队列来不及处理，
-	// 连接被中途断开后重连、重新握手，整体反而更慢
-	const BATCH_SIZE = 5;
+	// 每批 10 卷、间隔 100ms。更快会把服务端转发队列灌满，
+	// 连接被中途断开后重连，整体反而更慢
+	const BATCH_SIZE = 10;
 	const BATCH_DELAY_MS = 100;
 
 	while (currentVolume < total) {
@@ -813,6 +833,8 @@ function handleFileStart(message, isPrivate, chat) {
 		status: 'receiving',
 		originalHash,
 		archiveHash,
+		// 老版本客户端不带这个字段，默认按压缩过处理
+		compressed: message.compressed !== false,
 		fileCount,
 		fileManifest,
 		isArchive,
@@ -1020,7 +1042,7 @@ export async function downloadFile(fileId) {
 			// 删除系统提示
 		} else {
 			// Download single file
-			await decompressVolumesToFile(transfer.volumeData, transfer.fileName, transfer.originalHash);
+			await decompressVolumesToFile(transfer.volumeData, transfer.fileName, transfer.originalHash, transfer.compressed !== false);
 			// 删除系统提示
 		}
 	} catch (error) {

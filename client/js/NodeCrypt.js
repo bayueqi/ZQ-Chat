@@ -570,7 +570,8 @@ class NodeCrypt {
 		try {
 			message = Buffer.from(JSON.stringify(message), 'utf8');
 			if ((message.length % 16) !== 0) {
-				message = Buffer.from([...message, ...Buffer.alloc(16 - (message.length % 16))])
+				// 展开成数组再拼回去，几百 KB 的数据要多花二十多毫秒
+				message = Buffer.concat([message, Buffer.alloc(16 - (message.length % 16))])
 			}
 			const iv = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
 			const cipher = new ModeOfOperation.cbc(key, iv);
@@ -602,7 +603,7 @@ class NodeCrypt {
 		try {
 			message = Buffer.from(JSON.stringify(message), 'utf8');
 			if ((message.length % 16) !== 0) {
-				message = Buffer.from([...message, ...Buffer.alloc(16 - (message.length % 16))])
+				message = Buffer.concat([message, Buffer.alloc(16 - (message.length % 16))])
 			}
 			const iv = Buffer.from(crypto.getRandomValues(new Uint8Array(12)));
 			const counter = Buffer.from(crypto.getRandomValues(new Uint8Array(4)));
