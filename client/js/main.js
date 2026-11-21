@@ -103,6 +103,9 @@ window.setupEmojiPicker = setupEmojiPicker;
 window.handleFileMessage = handleFileMessage;
 window.downloadFile = downloadFile;
 
+// 文件开始消息可能因连接抖动重发，本地聊天记录只插一次
+const loggedFileStarts = new Set();
+
 // 当 DOM 内容加载完成后执行初始化逻辑
 // Run initialization logic when the DOM content is fully loaded
 window.addEventListener('DOMContentLoaded', () => {
@@ -282,8 +285,8 @@ window.addEventListener('DOMContentLoaded', () => {
 		inputSelector: '.input-message-input', // 消息输入框选择器 / Message input selector
 		attachBtnSelector: '.chat-attach-btn', // 附件按钮选择器 / Attach button selector
 		fileInputSelector: '.new-message-wrapper input[type="file"]', // 文件输入框选择器 / File input selector
-		onSend: (message) => {
-			const rd = roomsData[activeRoomIndex];
+		onSend: (message, targetRoom) => {
+			const rd = targetRoom || roomsData[activeRoomIndex];
 			if (rd && rd.chat) {
 				const userName = rd.myUserName || '';
 				const msgWithUser = { ...message, userName };
@@ -304,25 +307,33 @@ window.addEventListener('DOMContentLoaded', () => {
 							c: rd.privateChatTargetId
 						};
 						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
-						rd.chat.sendMessage(encryptedMessageForServer);
+						const sent = rd.chat.sendMessage(encryptedMessageForServer);
 						
 						// 添加到自己的聊天记录
-						if (msgWithUser.type === 'file_start') {
+						if (msgWithUser.type === 'file_start' && !loggedFileStarts.has(msgWithUser.fileId)) {
+							loggedFileStarts.add(msgWithUser.fileId);
 							addMsg(msgWithUser, false, 'file_private');
-						}					} else {
+						}
+						return sent;
+					} else {
 						addSystemMsg(`${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						return false;
 					}
 				} else {
 					// 公共频道文件发送
 					// Send file to public channel
-					rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
+					const sent = rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
 					
 					// 添加到自己的聊天记录
-					if (msgWithUser.type === 'file_start') {
+					if (msgWithUser.type === 'file_start' && !loggedFileStarts.has(msgWithUser.fileId)) {
+						loggedFileStarts.add(msgWithUser.fileId);
 						addMsg(msgWithUser, false, 'file');
 					}
+					return sent;
 				}
-			}		}
+			}
+			return false;
+		}
 	});
 
 

@@ -24,6 +24,22 @@ import { t } from './util.i18n.js';
 let roomsData = [];
 let activeRoomIndex = -1;
 
+// 有人从成员列表中消失后，等这么久再确认是否真的离开。
+// 重连的客户端会换新的 clientId，重新握手前不会出现在列表里，立即判定会误报。
+const LEAVE_CONFIRM_MS = 8000;
+const nameOfUser = (u) => (u && (u.userName || u.username || u.name)) || '';
+
+// 供文件传输层取当前加密连接，用于发送背压与补发控制消息
+window.getActiveChat = () => {
+	const rd = roomsData[activeRoomIndex];
+	return rd && rd.chat ? rd.chat : null;
+};
+
+// 供上传流程在发起时锁定目标房间，压缩大文件期间切换房间不会发错地方
+window.getActiveRoomData = () => {
+	return roomsData[activeRoomIndex] || null;
+};
+
 // Get a new room data object
 // 获取一个新的房间数据对象
 export function getNewRoomData() {
@@ -109,6 +125,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	const callbacks = {
 		onServerClosed: () => {
 			setStatus('Node connection closed');
+			if (roomsData[idx]) roomsData[idx].reconnecting = true;
 			if (onResult && !closed) {
 				closed = true;
 				onResult(false)
@@ -126,6 +143,12 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 			if (onResult && !closed) {
 				closed = true;
 				onResult(true)
+			}
+			const rd = roomsData[idx];
+			if (rd && rd.reconnecting) {
+				// 重连后重新握手会重建成员列表，这段时间内不产生进出的系统消息
+				rd.reconnecting = false;
+				rd.suppressPresenceUntil = Date.now() + 8000;
 			}
 			addSystemMsg(t('system.secured', 'connection secured'))
 		},
@@ -145,16 +168,54 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 export function handleClientList(idx, list, selfId) {
 	const rd = roomsData[idx];
 	if (!rd) return;
-	const oldUserIds = new Set((rd.userList || []).map(u => u.clientId));
-	const newUserIds = new Set(list.map(u => u.clientId));
-	for (const oldId of oldUserIds) {
-		if (!newUserIds.has(oldId)) {
-			handleClientLeft(idx, oldId)
+
+	const nameOf = nameOfUser;
+
+	// 断线重连后服务端会分配新的 clientId，同一个人看起来就成了新用户。
+	// 人员是否离开按用户名判断，clientId 只用于定位记录。
+	const suppressed = rd.suppressPresenceUntil && Date.now() < rd.suppressPresenceUntil;
+
+	// 名单里重新出现的人，取消待确认的离开
+	if (rd.pendingLeft) {
+		for (const [pendingId, entry] of rd.pendingLeft) {
+			const back = entry.name
+				? list.some(u => nameOf(u) === entry.name)
+				: list.some(u => u.clientId === pendingId);
+			if (back) {
+				clearTimeout(entry.timer);
+				rd.pendingLeft.delete(pendingId);
+			}
 		}
 	}
-	rd.userList = list;
+
+	if (!suppressed) {
+		const newNames = new Set(list.map(nameOf).filter(Boolean));
+		const retained = [];
+		for (const oldUser of (rd.userList || []).slice()) {
+			const name = nameOf(oldUser);
+			const stillHere = name
+				? newNames.has(name)
+				: list.some(u => u.clientId === oldUser.clientId);
+			if (!stillHere) {
+				// 先留在名单里等确认，避免重连的人在界面上闪一下又回来
+				scheduleClientLeft(idx, oldUser);
+				retained.push(oldUser);
+			}
+		}
+		rd.userList = list.concat(retained);
+	} else {
+		// 重连握手中：只并入新出现的用户，保留尚未完成密钥交换的老记录，名单不闪空
+		const merged = (rd.userList || []).slice();
+		for (const user of list) {
+			const name = nameOf(user);
+			const at = name ? merged.findIndex(u => nameOf(u) === name) : -1;
+			if (at >= 0) merged[at] = user; else merged.push(user);
+		}
+		rd.userList = merged;
+	}
+
 	rd.userMap = {};
-	list.forEach(u => {
+	rd.userList.forEach(u => {
 		rd.userMap[u.clientId] = u
 	});
 	rd.myId = selfId;
@@ -165,7 +226,8 @@ export function handleClientList(idx, list, selfId) {
 	rd.initCount = (rd.initCount || 0) + 1;
 	if (rd.initCount === 2) {
 		rd.isInitialized = true;
-		rd.knownUserIds = new Set(list.map(u => u.clientId))
+		rd.knownUserIds = new Set(rd.userList.map(u => u.clientId));
+		rd.knownUserNames = new Set(rd.userList.map(nameOf).filter(Boolean));
 	}
 }
 
@@ -174,13 +236,35 @@ export function handleClientList(idx, list, selfId) {
 export function handleClientSecured(idx, user) {
 	const rd = roomsData[idx];
 	if (!rd) return;
-	rd.userMap[user.clientId] = user;
-	const existingUserIndex = rd.userList.findIndex(u => u.clientId === user.clientId);
-	if (existingUserIndex === -1) {
+
+	const nameOf = (u) => (u && (u.userName || u.username || u.name)) || '';
+	const userName = nameOf(user);
+	const displayName = userName || t('ui.anonymous', 'Anonymous');
+
+	// 这个人的新连接已经握手完成，取消待确认的离开
+	if (userName && rd.pendingLeft) {
+		for (const [pendingId, entry] of rd.pendingLeft) {
+			if (entry.name === userName) {
+				clearTimeout(entry.timer);
+				rd.pendingLeft.delete(pendingId);
+			}
+		}
+	}
+
+	// 重连后同一用户会带着新的 clientId 回来，按用户名合并，避免名单里出现两个同名条目
+	let at = rd.userList.findIndex(u => u.clientId === user.clientId);
+	if (at < 0 && userName) {
+		at = rd.userList.findIndex(u => nameOf(u) === userName);
+	}
+	if (at === -1) {
 		rd.userList.push(user)
 	} else {
-		rd.userList[existingUserIndex] = user
+		rd.userList[at] = user
 	}
+	rd.userMap = {};
+	rd.userList.forEach(u => {
+		rd.userMap[u.clientId] = u
+	});
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
 		renderMainHeader()
@@ -188,10 +272,23 @@ export function handleClientSecured(idx, user) {
 	if (!rd.isInitialized) {
 		return
 	}
-	const isNew = !rd.knownUserIds.has(user.clientId);
+	if (rd.suppressPresenceUntil && Date.now() < rd.suppressPresenceUntil) {
+		// 重连期间只更新名单，不产生进出的系统消息
+		if (userName) {
+			rd.knownUserNames = rd.knownUserNames || new Set();
+			rd.knownUserNames.add(userName);
+		}
+		rd.knownUserIds.add(user.clientId);
+		return
+	}
+	rd.knownUserNames = rd.knownUserNames || new Set();
+	const isNew = userName
+		? !rd.knownUserNames.has(userName)
+		: !rd.knownUserIds.has(user.clientId);
 	if (isNew) {
-		rd.knownUserIds.add(user.clientId);		const name = user.userName || user.username || user.name || t('ui.anonymous', 'Anonymous');
-		const msg = `${name} ${t('system.joined', 'joined the conversation')}`;
+		rd.knownUserIds.add(user.clientId);
+		if (userName) rd.knownUserNames.add(userName);
+		const msg = `${displayName} ${t('system.joined', 'joined the conversation')}`;
 		rd.messages.push({
 			type: 'system',
 			text: msg
@@ -201,6 +298,34 @@ export function handleClientSecured(idx, user) {
 			window.notifyMessage(rd.roomName, 'system', msg)
 		}
 	}
+}
+
+// 成员从列表中消失后延迟确认，避免重连换 id 被误判成离开
+function scheduleClientLeft(idx, user) {
+	const rd = roomsData[idx];
+	if (!rd) return;
+	const clientId = user && user.clientId;
+	if (!clientId) return;
+
+	rd.pendingLeft = rd.pendingLeft || new Map();
+	if (rd.pendingLeft.has(clientId)) return;
+
+	const entry = {
+		name: nameOfUser(user),
+		timer: setTimeout(() => {
+			rd.pendingLeft.delete(clientId);
+			// 到期再确认一次：同名的人（可能是新连接）已经回到名单就不算离开
+			const stillGone = entry.name
+				? !(rd.userList || []).some(u => nameOfUser(u) === entry.name)
+				: !(rd.userList || []).some(u => u.clientId === clientId);
+			if (!stillGone) return;
+			// 名字已经不在 userMap 里，补回去让离开提示能显示正确的人
+			if (!rd.userMap[clientId]) rd.userMap[clientId] = user;
+			handleClientLeft(idx, clientId);
+		}, LEAVE_CONFIRM_MS)
+	};
+
+	rd.pendingLeft.set(clientId, entry);
 }
 
 // Handle client left event
@@ -225,6 +350,9 @@ export function handleClientLeft(idx, clientId) {
 	if (activeRoomIndex === idx) addSystemMsg(msg, true);
 	rd.userList = rd.userList.filter(u => u.clientId !== clientId);
 	delete rd.userMap[clientId];
+	// 确认离开后清掉已知名单，同一账号之后重新进来才会提示加入
+	const userName = nameOfUser(user);
+	if (userName && rd.knownUserNames) rd.knownUserNames.delete(userName);
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
 		renderMainHeader()
@@ -279,13 +407,17 @@ export function handleClientMessage(idx, msg) {
 		}
 
 		// Part 2: Handle UI interaction (rendering in active room, or unread count in inactive room)
-		if (activeRoomIndex === idx) {
-			// If it's the active room, delegate to util.file.js to handle UI and file transfer state.
-			// This applies to all file-related messages (file_start, file_volume, file_end, etc.)
+		const incomingFileId = msg.data && msg.data.fileId;
+		const trackingThisFile = incomingFileId ? window.fileTransfers.has(incomingFileId) : false;
+
+		// 分卷必须持续累积，否则切换房间期间的缺卷会让传输永远停在中途
+		if (activeRoomIndex === idx || trackingThisFile) {
 			if (window.handleFileMessage) {
-				window.handleFileMessage(msg.data, msgType.includes('_private'));
+				window.handleFileMessage(msg.data, msgType.includes('_private'), newRd.chat);
 			}
-		} else {
+		}
+
+		if (activeRoomIndex !== idx) {
 			// If it's not the active room, only increment unread count for 'file_start' messages.
 			if (msgType === 'file_start' || msgType === 'file_start_private') {
 				newRd.unreadCount = (newRd.unreadCount || 0) + 1;

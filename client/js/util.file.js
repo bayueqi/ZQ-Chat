@@ -4,11 +4,44 @@ import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
 
 // 分卷大小统一配置
-const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
+const DEFAULT_VOLUME_SIZE = 256 * 1024; // 256KB 原始数据，编码并加密后单卷约 460KB
+
+// 未写入连接的字节数超过此值时暂停发送。不设上限时大文件会把几百兆数据
+// 堆在发送缓冲区里，心跳和数据控制消息排在后面，连接被判定超时后重连。
+const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+// 接收端向发送端请求补发的最大轮数
+const MAX_NACK_ATTEMPTS = 3;
+// 分卷中断多久后判定为缺卷并请求补发
+const STALL_TIMEOUT_MS = 15000;
+// 请求补发持续多久仍不完整则放弃
+const NACK_GIVEUP_MS = 300000;
+// 发送完毕后等待对方确认收齐的超时
+const ACK_TIMEOUT_MS = 90000;
+// 连续无法写入连接多久后中止本次传输
+const SEND_ABORT_MS = 120000;
 
 // File transfer state management
 // 文件传输状态管理
 window.fileTransfers = new Map();
+
+// 当前房间的加密连接，由 room.js 注册
+function getActiveChat() {
+	return (typeof window.getActiveChat === 'function' ? window.getActiveChat() : null);
+}
+
+// 连接可用且发送缓冲区未堆积时才允许写入
+function isChatWritable(chat) {
+	if (!chat || !chat.isOpen()) return false;
+	const connection = chat.connection;
+	return !(connection && connection.bufferedAmount > MAX_BUFFERED_BYTES);
+}
+
+// 发送文件控制消息（确认收齐、请求补发）
+function sendFileControl(message, chat) {
+	const target = chat || getActiveChat();
+	if (!target || !target.isOpen()) return false;
+	return target.sendChannelMessage(message.type, message) !== false;
+}
 
 // Base64 encoding for binary data (more efficient than hex)
 // Base64编码用于二进制数据（比十六进制更高效）
@@ -359,14 +392,13 @@ export function setupFileSend({
 			e.stopPropagation();
 			
 			showFileUploadModal(async (files) => {
-				// 传递 userName 给 onSend
-				const userName = window.roomsData && window.activeRoomIndex >= 0
-					? (window.roomsData[window.activeRoomIndex]?.myUserName || '')
-					: '';
+				// 发起时锁定目标房间，压缩大文件期间切换到其他房间也不会发错
+				const targetRoom = (typeof window.getActiveRoomData === 'function' ? window.getActiveRoomData() : null);
+				const userName = targetRoom ? (targetRoom.myUserName || '') : '';
 				await handleFilesUpload(files, (msg) => {
-					// 合并 userName 字段
-					onSend({ ...msg, userName });
-				});
+					// 合并 userName 字段，并回传是否真正写入连接
+					return onSend({ ...msg, userName }, targetRoom);
+				}, targetRoom && targetRoom.chat ? targetRoom.chat : null);
 			});
 		});
 	}
@@ -374,8 +406,25 @@ export function setupFileSend({
 
 // Handle files upload
 // 处理文件上传
-async function handleFilesUpload(files, onSend) {
+async function handleFilesUpload(files, onSend, chat = null) {
 	if (!files || files.length === 0) return;
+
+	// 文件开始消息决定接收端是否建立传输，发不出去的话后面所有分卷都会被丢弃
+	const sendStart = async (payload) => {
+		const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+		const deadline = Date.now() + SEND_ABORT_MS;
+		while (Date.now() < deadline) {
+			if (isChatWritable(chat) && onSend(payload) !== false) return true;
+			await sleep(200);
+		}
+		return false;
+	};
+
+	const abortUpload = (label) => {
+		if (window.addSystemMsg) {
+			window.addSystemMsg(`Failed to send ${label}: no recipient available`);
+		}
+	};
 	
 	const fileId = generateFileId();
 	
@@ -409,13 +458,14 @@ async function handleFilesUpload(files, onSend) {
 				totalVolumes: volumes.length,
 				sentVolumes: 0,
 				status: 'sending',
-				originalHash
+				originalHash,
+				chat
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
 			
 			// Send file start message
-			onSend({
+			const started = await sendStart({
 				type: 'file_start',
 				fileId,
 				fileName: file.name,
@@ -424,6 +474,11 @@ async function handleFilesUpload(files, onSend) {
 				totalVolumes: volumes.length,
 				originalHash
 			});
+			if (!started) {
+				abortUpload(file.name);
+				window.fileTransfers.delete(fileId);
+				return;
+			}
 			
 			// Send volumes
 			await sendVolumes(fileId, volumes, onSend, updateProgress, file.name);
@@ -449,13 +504,14 @@ async function handleFilesUpload(files, onSend) {
 				archiveHash,
 				fileCount,
 				fileManifest,
-				isArchive: true
+				isArchive: true,
+				chat
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
 			
 			// Send archive start message
-			onSend({
+			const started = await sendStart({
 				type: 'file_start',
 				fileId,
 				fileName: `${files.length} files`,
@@ -467,6 +523,11 @@ async function handleFilesUpload(files, onSend) {
 				fileManifest,
 				isArchive: true
 			});
+			if (!started) {
+				abortUpload(`${files.length} files`);
+				window.fileTransfers.delete(fileId);
+				return;
+			}
 			
 			// Send volumes
 			await sendVolumes(fileId, volumes, onSend, updateProgress, `${files.length} files`);
@@ -485,53 +546,90 @@ async function handleFilesUpload(files, onSend) {
 async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	const fileTransfer = window.fileTransfers.get(fileId);
 	if (!fileTransfer) return;
-	
-	let currentVolume = 0;
-	const batchSize = 5; // 每批发送5个分卷
-	
-	function sendNextBatch() {
-		if (currentVolume >= volumes.length) {
-			// 发送完成消息
-			onSend({
-				type: 'file_complete',
-				fileId
-			});
-			
-			fileTransfer.status = 'completed';
-			updateFileProgress(fileId);
-			updateProgress(`✓ Sent ${fileName} successfully`);
-			return;
-		}
-		
-		// 发送当前批次
-		const batchEnd = Math.min(currentVolume + batchSize, volumes.length);
-		const batch = [];
-		
-		for (let i = currentVolume; i < batchEnd; i++) {
-			batch.push({
-				type: 'file_volume',
-				fileId,
-				volumeIndex: i,
-				volumeData: volumes[i],
-				isLast: i === volumes.length - 1
-			});
-		}
-		
-		// 发送批次中的所有分卷
-		batch.forEach(volumeMsg => onSend(volumeMsg));
-		
-		// 更新发送进度
-		fileTransfer.sentVolumes = batchEnd;
+
+	// 保留分卷引用，接收端缺卷时按需补发
+	fileTransfer.volumes = volumes;
+
+	const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+	const total = volumes.length;
+
+	// 绑定发起时的连接，期间切换房间也不会写到别的房间去
+	const chat = fileTransfer.chat || getActiveChat();
+	const canWrite = () => isChatWritable(chat);
+
+	// 单卷发送，返回是否真正写入连接
+	const writeVolume = (index) => onSend({
+		type: 'file_volume',
+		fileId,
+		volumeIndex: index,
+		volumeData: volumes[index],
+		isLast: index === total - 1
+	}) !== false;
+
+	const finish = () => {
+		fileTransfer.sendDone = true;
+		onSend({ type: 'file_complete', fileId });
+		// 数据已全部发出，等接收端回 file_ack 再收尾
+		fileTransfer.status = 'sent';
 		updateFileProgress(fileId);
-		
-		currentVolume = batchEnd;
-		
-		// 继续发送下一批，使用较短的延迟
-		setTimeout(sendNextBatch, 100);
+		updateProgress(`✓ Sent ${fileName} successfully`);
+		setTimeout(() => {
+			const transfer = window.fileTransfers.get(fileId);
+			if (transfer && transfer.status === 'sent') {
+				transfer.status = 'completed';
+				updateFileProgress(fileId);
+			}
+		}, ACK_TIMEOUT_MS);
+	};
+
+	// 接收端报告缺卷时补发，主循环进行中也要响应（连接抖动会丢在途分卷）
+	fileTransfer.resend = async (indices) => {
+		for (const index of indices) {
+			if (!Number.isInteger(index) || index < 0 || index >= total) continue;
+			while (!canWrite()) await sleep(200);
+			while (!writeVolume(index)) await sleep(200);
+			await sleep(0);
+		}
+		// 补发期间主循环还未结束的话，完成消息由主循环负责发出
+		if (fileTransfer.sendDone) {
+			onSend({ type: 'file_complete', fileId });
+		}
+	};
+
+	let currentVolume = 0;
+	let stalledSince = 0;
+
+	while (currentVolume < total) {
+		// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
+		// 不跳过、不计入已发送，等连接恢复后从这一卷继续
+		const sent = canWrite() ? writeVolume(currentVolume) : false;
+
+		if (!sent) {
+			if (!stalledSince) stalledSince = Date.now();
+			// 长时间无法写入说明对端不存在或连接始终没有恢复，中止并提示
+			if (Date.now() - stalledSince > SEND_ABORT_MS) {
+				if (window.addSystemMsg) {
+					window.addSystemMsg(`File transfer aborted: no recipient available (${currentVolume}/${total} sent)`);
+				}
+				fileTransfer.status = 'completed';
+				updateFileProgress(fileId);
+				return;
+			}
+			await sleep(200);
+			continue;
+		}
+
+		stalledSince = 0;
+		currentVolume++;
+		fileTransfer.sentVolumes = currentVolume;
+		if (currentVolume === total || (currentVolume % 8) === 0) {
+			updateFileProgress(fileId);
+		}
+		// 让出主线程，避免压缩与加密把页面卡死
+		await sleep(0);
 	}
-	
-	// 开始发送
-	sendNextBatch();
+
+	finish();
 }
 
 // Update file progress in chat
@@ -569,6 +667,18 @@ function updateFileProgress(fileId) {
 			}
 			if (progressBar) progressBar.style.width = `${progress}%`;
 			if (statusText) statusText.textContent = `Receiving ${transfer.receivedVolumes.size}/${transfer.totalVolumes}`;
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
+			}
+		} else if (transfer.status === 'sent') {
+			// 数据已发出，等接收端确认收齐
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = '100%';
+			if (statusText) statusText.textContent = 'Waiting for receiver';
 			if (downloadBtn) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
@@ -612,12 +722,12 @@ function updateFileProgress(fileId) {
 
 // Handle incoming file messages
 // 处理接收到的文件消息
-export function handleFileMessage(message, isPrivate = false) {
+export function handleFileMessage(message, isPrivate = false, chat = null) {
 	const { type, fileId, userName } = message;
 	
 	switch (type) {
 		case 'file_start':
-			handleFileStart(message, isPrivate);
+			handleFileStart(message, isPrivate, chat);
 			break;
 		case 'file_volume':
 			handleFileVolume(message);
@@ -625,13 +735,22 @@ export function handleFileMessage(message, isPrivate = false) {
 		case 'file_complete':
 			handleFileComplete(message);
 			break;
+		case 'file_nack':
+			handleFileNack(message);
+			break;
+		case 'file_ack':
+			handleFileAck(message);
+			break;
 	}
 }
 
 // Handle file start message
 // 处理文件开始消息
-function handleFileStart(message, isPrivate) {
+function handleFileStart(message, isPrivate, chat) {
 	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName } = message;
+
+	// 开始消息可能因连接抖动重发，同一份文件只建立一次传输状态
+	if (window.fileTransfers.has(fileId)) return;
 	
 	const fileTransfer = {
 		fileId,
@@ -647,11 +766,15 @@ function handleFileStart(message, isPrivate) {
 		fileCount,
 		fileManifest,
 		isArchive,
-		userName // 记录发送者名字
+		userName, // 记录发送者名字
+		chat: chat || getActiveChat() // 回到这条消息所属房间的连接，用于确认收齐和请求补发
 	};
 	
 	window.fileTransfers.set(fileId, fileTransfer);
-	
+
+	// 分卷中途中断（连接抖动、对端停止发送）时主动核对缺卷
+	armStallTimer(fileId);
+
 	// 添加文件消息到聊天
 	if (window.addOtherMsg) {
 		let displayData;
@@ -686,13 +809,21 @@ function handleFileStart(message, isPrivate) {
 function handleFileVolume(message) {
 	const { fileId, volumeIndex, volumeData } = message;
 	const transfer = window.fileTransfers.get(fileId);
-	
-	if (!transfer) return;
-	
+
+	if (!transfer || transfer.status === 'completed') return;
+
 	transfer.receivedVolumes.add(volumeIndex);
 	transfer.volumeData[volumeIndex] = volumeData;
-	
-	updateFileProgress(fileId);
+	armStallTimer(fileId);
+
+	if (transfer.receivedVolumes.size === transfer.totalVolumes) {
+		finishReceive(fileId, transfer);
+		return;
+	}
+	// 大文件逐卷刷新会拖慢主线程，按间隔取样
+	if (transfer.totalVolumes <= 10 || (transfer.receivedVolumes.size % 8) === 0) {
+		updateFileProgress(fileId);
+	}
 }
 
 // Handle file complete message
@@ -700,14 +831,122 @@ function handleFileVolume(message) {
 function handleFileComplete(message) {
 	const { fileId } = message;
 	const transfer = window.fileTransfers.get(fileId);
-	
-	if (!transfer) return;
-	
-	// 检查是否所有分卷都已接收
+
+	if (!transfer || transfer.status === 'completed') return;
+
+	// 对端已声明发完，后续补发请求按次数限制
+	transfer.doneSignaled = true;
+
 	if (transfer.receivedVolumes.size === transfer.totalVolumes) {
+		finishReceive(fileId, transfer);
+		return;
+	}
+	// 对端已发完但本端仍有缺口：请求补发
+	requestMissingVolumes(fileId, transfer, true);
+}
+
+// 接收端收齐：标记完成、通知发送端、清理计时器
+function finishReceive(fileId, transfer) {
+	if (transfer.status === 'completed') return;
+	clearStallTimer(transfer);
+	transfer.stallSince = 0;
+	transfer.status = 'completed';
+	updateFileProgress(fileId);
+	sendFileControl({ type: 'file_ack', fileId }, transfer.chat);
+}
+
+// 记录最后一次收到分卷的时间，长时间无新数据时核对缺口
+function armStallTimer(fileId) {
+	const transfer = window.fileTransfers.get(fileId);
+	if (!transfer || transfer.status === 'completed') return;
+	clearStallTimer(transfer);
+	transfer.stallTimer = setTimeout(() => {
+		transfer.stallTimer = null;
+		const current = window.fileTransfers.get(fileId);
+		if (!current || current.status === 'completed') return;
+		if (current.receivedVolumes.size < current.totalVolumes) {
+			requestMissingVolumes(fileId, current);
+		}
+	}, STALL_TIMEOUT_MS);
+}
+
+function clearStallTimer(transfer) {
+	if (transfer && transfer.stallTimer) {
+		clearTimeout(transfer.stallTimer);
+		transfer.stallTimer = null;
+	}
+}
+
+// 收集缺失分卷索引并向发送端请求补发
+function requestMissingVolumes(fileId, transfer, fromComplete = false) {
+	if (!transfer || transfer.status === 'completed') return;
+
+	const missing = [];
+	for (let i = 0; i < transfer.totalVolumes; i++) {
+		if (!transfer.receivedVolumes.has(i)) missing.push(i);
+	}
+	if (missing.length === 0) {
+		finishReceive(fileId, transfer);
+		return;
+	}
+
+	// 从第一次发现缺口起计时，对端消失后不至于无限重试
+	if (!transfer.stallSince) transfer.stallSince = Date.now();
+	const giveUp = () => {
+		if (window.addSystemMsg) {
+			window.addSystemMsg(`File transfer incomplete: ${missing.length} of ${transfer.totalVolumes} parts missing`);
+		}
+		transfer.status = 'completed';
+		updateFileProgress(fileId);
+	};
+
+	if (Date.now() - transfer.stallSince > NACK_GIVEUP_MS) {
+		giveUp();
+		return;
+	}
+
+	// 对方已声明发送完毕时，补发请求次数有限；传输途中的缺口可以反复探测
+	if (fromComplete) {
+		transfer.nackAttempts = (transfer.nackAttempts || 0) + 1;
+		if (transfer.nackAttempts > MAX_NACK_ATTEMPTS) {
+			giveUp();
+			return;
+		}
+	}
+
+	if (!sendFileControl({ type: 'file_nack', fileId, missing }, transfer.chat)) {
+		// 连接尚未恢复，稍后再试，不计入补发次数
+		setTimeout(() => requestMissingVolumes(fileId, transfer, fromComplete), 3000);
+		return;
+	}
+
+	setTimeout(() => {
+		const current = window.fileTransfers.get(fileId);
+		if (current && current.status !== 'completed' && current.receivedVolumes.size < current.totalVolumes) {
+			requestMissingVolumes(fileId, current, current.doneSignaled);
+		}
+	}, STALL_TIMEOUT_MS);
+}
+
+// 发送端收到补发请求，按索引重发
+function handleFileNack(message) {
+	const { fileId, missing } = message;
+	const transfer = window.fileTransfers.get(fileId);
+	if (!transfer || typeof transfer.resend !== 'function' || !Array.isArray(missing) || missing.length === 0) return;
+	transfer.resend(missing);
+}
+
+// 发送端收到收齐确认，收尾并释放分卷引用
+function handleFileAck(message) {
+	const { fileId } = message;
+	const transfer = window.fileTransfers.get(fileId);
+	if (!transfer) return;
+	if (transfer.status === 'sent' || transfer.status === 'sending') {
 		transfer.status = 'completed';
 		updateFileProgress(fileId);
 	}
+	transfer.volumes = null;
+	transfer.resend = null;
 }
 
 // Download file from volumes

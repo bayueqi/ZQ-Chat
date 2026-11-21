@@ -181,6 +181,7 @@ class NodeCrypt {
 			return
 		}
 		if (event.data === 'pong') {
+			this.lastPongAt = Date.now();
 			return
 		}
 		this.logEvent('onMessage', event.data);
@@ -435,7 +436,40 @@ class NodeCrypt {
 	startPing() {
 		this.stopPing();
 		this.logEvent('startPing');
+		this.lastPongAt = Date.now();
+
+		if (typeof document !== 'undefined' && !this.visibilityBound) {
+			this.visibilityBound = true;
+			document.addEventListener('visibilitychange', () => {
+				if (!document.hidden) {
+					// 后台期间定时器被节流，回到前台补齐一次心跳，避免误判掉线
+					this.lastPongAt = Date.now();
+					this.sendMessage('ping');
+				}
+			});
+		}
+
 		this.ping = setInterval(() => {
+			// 标签页在后台时定时器会被浏览器节流，此时不能据此判断连接状态
+			if (typeof document !== 'undefined' && document.hidden) {
+				return
+			}
+			// 连续三个周期没有任何回应，说明连接已在中间环节断开，主动重连
+			if (Date.now() - this.lastPongAt > this.config.pingInterval * 3) {
+				this.logEvent('ping-timeout');
+				this.disconnect();
+				if (this.credentials && this.callbacks.onServerClosed) {
+					try {
+						this.callbacks.onServerClosed()
+					} catch (error) {
+						this.logEvent('ping-timeout-callback', error, 'error')
+					}
+				}
+				if (this.credentials) {
+					this.startReconnect()
+				}
+				return
+			}
 			this.sendMessage('ping')
 		}, this.config.pingInterval)
 	}
@@ -497,16 +531,19 @@ class NodeCrypt {
 						}
 					}
 				}
-				if (Object.keys(payloads).length > 0) {
-					const payload = this.encryptServerMessage({
-						a: 'w',
-						p: payloads,
-					}, this.serverShared);
-					if (!this.isOpen() || payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
-						return (false)
-					}
-					this.connection.send(payload)
+				// 频道里没有完成密钥交换的接收者时消息发不出去，必须返回失败，
+				// 否则调用方会以为已经发送成功（重连瞬间就会走到这里）
+				if (Object.keys(payloads).length === 0) {
+					return (false)
 				}
+				const payload = this.encryptServerMessage({
+					a: 'w',
+					p: payloads,
+				}, this.serverShared);
+				if (!this.isOpen() || payload.length === 0 || payload.length > (8 * 1024 * 1024)) {
+					return (false)
+				}
+				this.connection.send(payload)
 				return (true)
 			} catch (error) {
 				this.logEvent('sendChannelMessage', error, 'error')
