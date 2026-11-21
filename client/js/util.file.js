@@ -3,8 +3,9 @@
 import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
 
-// 分卷大小统一配置
-const DEFAULT_VOLUME_SIZE = 256 * 1024; // 256KB 原始数据，编码并加密后单卷约 460KB
+// 分卷大小统一配置。单卷加密后约 620KB，仍低于 WebSocket 单条消息上限，
+// 再放大就会因为超出限制被服务端断开
+const DEFAULT_VOLUME_SIZE = 256 * 1024;
 
 // 未写入连接的字节数超过此值时暂停发送。不设上限时大文件会把几百兆数据
 // 堆在发送缓冲区里，心跳和数据控制消息排在后面，连接被判定超时后重连。
@@ -22,13 +23,15 @@ const SEND_ABORT_MS = 120000;
 // 超过这个大小的单文件不再压缩，直接分卷发送
 const COMPRESS_SKIP_BYTES = 8 * 1024 * 1024;
 // 接收端每收到多少卷回传一次进度
-const PROGRESS_ACK_EVERY = 8;
+const PROGRESS_ACK_EVERY = 4;
+// 距上次回报超过这个时间也补一次，避免卷数不整除时长时间没有回报
+const PROGRESS_ACK_INTERVAL_MS = 400;
 // 发送端最多领先接收端多少卷。接收端处理不过来时，它只能排队解密，
 // 期间发出的任何消息（文字、成员进出、确认）都排在几百兆数据后面，
 // 看起来就是对方根本没收到
-const SEND_WINDOW_VOLUMES = 16;
-// 超过这个时间没有收到进度回报就不再限制领先量，避免对方不回消息时卡死
-const PEER_PROGRESS_STALE_MS = 10000;
+const SEND_WINDOW_VOLUMES = 32;
+// 超过这个时间没有收到进度回报就按批放行，避免对端不回消息时死等
+const PEER_PROGRESS_STALE_MS = 1500;
 
 // File transfer state management
 // 文件传输状态管理
@@ -56,7 +59,8 @@ function sendFileControl(message, chat) {
 // Base64 encoding for binary data (more efficient than hex)
 // Base64编码用于二进制数据（比十六进制更高效）
 function arrayBufferToBase64(buffer) {
-	const uint8Array = new Uint8Array(buffer);
+	// 传入的常常已经是 Uint8Array 视图，再包一层会白拷贝一遍
+	const uint8Array = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
 	let binary = '';
 	const chunkSize = 0x8000; // 32KB chunks to avoid call stack limits
 	
@@ -110,13 +114,12 @@ async function compressFileToVolumes(file, volumeSize = DEFAULT_VOLUME_SIZE) { /
 				const originalHash = await calculateHash(arrayBuffer);
 
 				const split = (payload, didCompress) => {
-					const volumes = [];
-					for (let i = 0; i < payload.length; i += volumeSize) {
-						const volume = payload.slice(i, i + volumeSize);
-						volumes.push(arrayBufferToBase64(volume));
-					}
+					// 只保留原始数据，按卷切片和 base64 编码留到发送时做。
+					// 提前生成上千个 base64 字符串会在内存里多压一份整文件
 					resolve({
-						volumes,
+						payload,
+						volumeSize,
+						totalVolumes: Math.ceil(payload.length / volumeSize),
 						originalSize: file.size,
 						compressedSize: payload.length,
 						originalHash,
@@ -213,15 +216,10 @@ async function compressFilesToArchive(files, volumeSize = DEFAULT_VOLUME_SIZE) {
 					return;
 				}
 				
-				// Split compressed data into volumes
-				const volumes = [];
-				for (let i = 0; i < compressed.length; i += volumeSize) {
-					const volume = compressed.slice(i, i + volumeSize);
-					volumes.push(arrayBufferToBase64(volume));
-				}
-				
 				resolve({
-					volumes,
+					payload: compressed,
+					volumeSize,
+					totalVolumes: Math.ceil(compressed.length / volumeSize),
 					originalSize: totalLength,
 					compressedSize: compressed.length,
 					archiveHash,
@@ -250,9 +248,9 @@ function readFileAsArrayBuffer(file) {
 // 将分卷解压回文件
 async function decompressVolumesToFile(volumes, fileName, originalHash = null, compressedMode = true) {
 	try {
-		// Combine all volumes using base64 decoding
+		// 分卷在接收时就已解码成字节，这里只做拼接
 		const combinedData = volumes.map(volume => {
-			return base64ToArrayBuffer(volume);
+			return volume instanceof Uint8Array ? volume : base64ToArrayBuffer(volume);
 		});
 		
 		const totalLength = combinedData.reduce((sum, arr) => sum + arr.length, 0);
@@ -316,9 +314,9 @@ async function decompressVolumesToFile(volumes, fileName, originalHash = null, c
 // 将归档分卷解压为多个文件
 async function decompressArchiveToFiles(volumes, fileManifest, archiveHash = null) {
 	try {
-		// Combine all volumes using base64 decoding
+		// 分卷在接收时就已解码成字节，这里只做拼接
 		const combinedData = volumes.map(volume => {
-			return base64ToArrayBuffer(volume);
+			return volume instanceof Uint8Array ? volume : base64ToArrayBuffer(volume);
 		});
 		
 		const totalLength = combinedData.reduce((sum, arr) => sum + arr.length, 0);
@@ -471,7 +469,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 			const file = files[0];
 			showProgress();
 			
-			const { volumes, originalSize, compressedSize, originalHash, compressed } = await compressFileToVolumes(file);
+			const { payload, volumeSize, totalVolumes, originalSize, compressedSize, originalHash, compressed } = await compressFileToVolumes(file);
 			
 			updateProgress();
 			
@@ -482,7 +480,9 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				originalSize,
 				compressedSize,
 				compressed,
-				totalVolumes: volumes.length,
+				payload,
+				volumeSize,
+				totalVolumes,
 				sentVolumes: 0,
 				status: 'sending',
 				originalHash,
@@ -499,7 +499,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				originalSize,
 				compressedSize,
 				compressed,
-				totalVolumes: volumes.length,
+				totalVolumes,
 				originalHash
 			});
 			if (!started) {
@@ -509,14 +509,14 @@ async function handleFilesUpload(files, onSend, chat = null) {
 			}
 			
 			// Send volumes
-			await sendVolumes(fileId, volumes, onSend, updateProgress, file.name);
+			await sendVolumes(fileId, { payload, volumeSize, totalVolumes }, onSend, updateProgress, file.name);
 			
 		} else {
 			// Multiple files upload - create archive
 			const totalSize = files.reduce((sum, file) => sum + file.size, 0);
 			showProgress();
 			
-			const { volumes, originalSize, compressedSize, archiveHash, fileCount, fileManifest } = await compressFilesToArchive(files);
+			const { payload, volumeSize, totalVolumes, originalSize, compressedSize, archiveHash, fileCount, fileManifest } = await compressFilesToArchive(files);
 			
 			updateProgress();
 			
@@ -526,7 +526,9 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				fileName: `${files.length} files.zip`, // Virtual archive name
 				originalSize,
 				compressedSize,
-				totalVolumes: volumes.length,
+				payload,
+				volumeSize,
+				totalVolumes,
 				sentVolumes: 0,
 				status: 'sending',
 				archiveHash,
@@ -545,7 +547,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 				fileName: `${files.length} files`,
 				originalSize,
 				compressedSize,
-				totalVolumes: volumes.length,
+				totalVolumes,
 				archiveHash,
 				fileCount,
 				fileManifest,
@@ -558,7 +560,7 @@ async function handleFilesUpload(files, onSend, chat = null) {
 			}
 			
 			// Send volumes
-			await sendVolumes(fileId, volumes, onSend, updateProgress, `${files.length} files`);
+			await sendVolumes(fileId, { payload, volumeSize, totalVolumes }, onSend, updateProgress, `${files.length} files`);
 		}
 		
 	} catch (error) {
@@ -571,15 +573,18 @@ async function handleFilesUpload(files, onSend, chat = null) {
 
 // Send volumes with progress tracking
 // 发送分卷并跟踪进度
-async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
+async function sendVolumes(fileId, source, onSend, updateProgress, fileName) {
 	const fileTransfer = window.fileTransfers.get(fileId);
 	if (!fileTransfer) return;
 
-	// 保留分卷引用，接收端缺卷时按需补发
-	fileTransfer.volumes = volumes;
-
 	const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-	const total = volumes.length;
+	const total = source.totalVolumes;
+	// 发送时才切片编码：预先编好上千个 base64 会在内存里多压一整份文件
+	const volumeAt = (index) => {
+		const start = index * source.volumeSize;
+		const end = Math.min(start + source.volumeSize, source.payload.length);
+		return arrayBufferToBase64(source.payload.subarray(start, end));
+	};
 
 	// 绑定发起时的连接，期间切换房间也不会写到别的房间去
 	const chat = fileTransfer.chat || getActiveChat();
@@ -590,7 +595,7 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 		type: 'file_volume',
 		fileId,
 		volumeIndex: index,
-		volumeData: volumes[index],
+		volumeData: volumeAt(index),
 		isLast: index === total - 1
 	}) !== false;
 
@@ -614,8 +619,8 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 	fileTransfer.resend = async (indices) => {
 		for (const index of indices) {
 			if (!Number.isInteger(index) || index < 0 || index >= total) continue;
-			while (!canWrite()) await sleep(200);
-			while (!writeVolume(index)) await sleep(200);
+			while (!canWrite()) await sleep(10);
+			while (!writeVolume(index)) await sleep(10);
 			await sleep(0);
 		}
 		// 补发期间主循环还未结束的话，完成消息由主循环负责发出
@@ -626,24 +631,31 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 
 	let currentVolume = 0;
 	let stalledSince = 0;
+	let lastUiAt = 0;
 
-	// 每批 10 卷、间隔 100ms。更快会把服务端转发队列灌满，
-	// 连接被中途断开后重连，整体反而更慢
-	const BATCH_SIZE = 10;
-	const BATCH_DELAY_MS = 100;
+	// 进度条按时间节流，避免每卷都扫一遍 DOM
+	const refreshUi = (force) => {
+		if (force || Date.now() - lastUiAt >= 100) {
+			lastUiAt = Date.now();
+			updateFileProgress(fileId);
+		}
+	};
+
+	// 接收端最近一次回报距今多久；从没回报过则视为很久
+	const peerIdleFor = () => (fileTransfer.peerProgressAt ? Date.now() - fileTransfer.peerProgressAt : Infinity);
+	// 领先接收端的卷数，超过窗口就等一下，别把对方的消息队列顶穿
+	const aheadOfPeer = () => currentVolume - (fileTransfer.peerReceived || 0);
 
 	while (currentVolume < total) {
 		let moved = 0;
 		let waitPeer = false;
-		while (moved < BATCH_SIZE && currentVolume < total) {
-			// 接收端还没处理到的分卷太多就先停手。一直猛发会把对方的
-			// 消息队列堆到几百兆，期间所有消息都收不到
-			if (fileTransfer.peerProgressAt && Date.now() - fileTransfer.peerProgressAt < PEER_PROGRESS_STALE_MS) {
-				const ahead = currentVolume - (fileTransfer.peerReceived || 0);
-				if (ahead >= SEND_WINDOW_VOLUMES) {
-					waitPeer = true;
-					break;
-				}
+
+		while (currentVolume < total) {
+			// 接收端明确落后且还在正常回报时才限流。回报停了就说明
+			// 对端没有在追（或进度消息丢了），继续发比干等更快
+			if (peerIdleFor() < PEER_PROGRESS_STALE_MS && aheadOfPeer() >= SEND_WINDOW_VOLUMES) {
+				waitPeer = true;
+				break;
 			}
 			// 连接断开、缓冲区堆积、对方尚未完成密钥交换时停在当前位置，
 			// 不跳过、不计入已发送，等连接恢复后从这一卷继续
@@ -651,13 +663,16 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 			if (!sent) break;
 			currentVolume++;
 			moved++;
+			fileTransfer.sentVolumes = currentVolume;
+			// 每几卷让出一次主线程，页面在传输期间仍能响应点击与滚动
+			if ((moved & 3) === 0) await sleep(0);
 		}
 
 		if (moved === 0) {
 			// 等接收端追上，不算发送失败
 			if (waitPeer) {
 				stalledSince = 0;
-				await sleep(30);
+				await sleep(20);
 				continue;
 			}
 			if (!stalledSince) stalledSince = Date.now();
@@ -670,14 +685,13 @@ async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
 				updateFileProgress(fileId);
 				return;
 			}
-			await sleep(200);
+			// 缓冲区还没排空，很快就能继续，不必长等
+			await sleep(10);
 			continue;
 		}
 
 		stalledSince = 0;
-		fileTransfer.sentVolumes = currentVolume;
-		updateFileProgress(fileId);
-		await sleep(BATCH_DELAY_MS);
+		refreshUi(currentVolume === total);
 	}
 
 	finish();
@@ -879,16 +893,21 @@ function handleFileVolume(message) {
 
 	if (!transfer || transfer.status === 'completed') return;
 
+	// 收下就转成字节：字符串形态是同样数据的两倍内存，而且最后还要再解码一遍
 	transfer.receivedVolumes.add(volumeIndex);
-	transfer.volumeData[volumeIndex] = volumeData;
+	transfer.volumeData[volumeIndex] = base64ToArrayBuffer(volumeData);
 	armStallTimer(fileId);
 
 	if (transfer.receivedVolumes.size === transfer.totalVolumes) {
 		finishReceive(fileId, transfer);
 		return;
 	}
-	// 回传进度，发送端据此控制领先量，别把对方的消息队列堵住
-	if ((transfer.receivedVolumes.size % PROGRESS_ACK_EVERY) === 0) {
+	// 回传进度，发送端据此控制领先量，别把对方的消息队列堵住。
+	// 除了按卷数，也按时间兜底，避免回报被丢弃后发送端一直干等
+	const now = Date.now();
+	if ((transfer.receivedVolumes.size % PROGRESS_ACK_EVERY) === 0
+		|| now - (transfer.lastProgressAt || 0) >= PROGRESS_ACK_INTERVAL_MS) {
+		transfer.lastProgressAt = now;
 		sendFileControl({
 			type: 'file_progress',
 			fileId,
@@ -1020,7 +1039,8 @@ function handleFileAck(message) {
 		transfer.status = 'completed';
 		updateFileProgress(fileId);
 	}
-	transfer.volumes = null;
+	// 收齐确认后发送端不再需要原始数据，及时释放
+	transfer.payload = null;
 	transfer.resend = null;
 }
 
